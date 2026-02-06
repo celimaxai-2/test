@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Alipay Scan & Sheet</title>
   <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
   <script type="importmap">
     {
       "imports": {
@@ -46,6 +47,377 @@
 </head>
 <body class="bg-gray-50 min-h-screen">
   <div id="root"></div>
-  <script type="module" src="./index.tsx"></script>
+
+  <script type="text/babel" data-type="module">
+    import React, { useState, useCallback, useRef, useMemo } from "react";
+    import { createRoot } from "react-dom/client";
+    import { GoogleGenAI } from "@google/genai";
+    import { v4 as uuidv4 } from "uuid";
+    import {
+      Upload, ImagePlus, Key, Trash2, Zap, ShieldCheck,
+      Eye, EyeOff, CheckCircle2, AlertCircle, Loader2,
+      ImageIcon, Copy, TableIcon
+    } from "lucide-react";
+
+    // ── Gemini Service ──────────────────────────────────────────────────
+
+    const EXTRACTION_PROMPT = `You are an expert OCR and data extraction assistant. Analyze this Alipay transaction screenshot and extract the following fields into a JSON object.
+
+Required fields:
+1. "date" - Transaction date and time (format: YYYY-MM-DD HH:mm:ss if possible)
+2. "amount" - Transaction amount in CNY (numeric string, e.g., "128.00"). Use negative for refunds.
+3. "merchant" - Merchant/store name
+4. "productName" - Product or service description
+5. "status" - Transaction status (e.g., "交易成功", "退款成功", "待付款")
+6. "paymentMethod" - Payment method used (e.g., "余额宝", "花呗", "银行卡")
+7. "transactionId" - Transaction/order ID number
+
+Rules:
+- Return ONLY a valid JSON object, no markdown, no explanation.
+- If a field is not visible or not applicable, use an empty string "".
+- For amount, extract only the numeric value without currency symbol.
+- Keep Chinese characters as-is for status, merchant, and product names.
+
+Example output:
+{"date":"2024-03-15 14:30:22","amount":"89.90","merchant":"星巴克","productName":"拿铁咖啡 大杯","status":"交易成功","paymentMethod":"花呗","transactionId":"2024031522001423456789"}`;
+
+    function fileToBase64(file) {
+      return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(reader.result.split(",")[1]);
+        reader.onerror = reject;
+        reader.readAsDataURL(file);
+      });
+    }
+
+    function parseJsonResponse(text) {
+      let cleaned = text.trim();
+      const jsonBlockMatch = cleaned.match(/```(?:json)?\s*([\s\S]*?)```/);
+      if (jsonBlockMatch) cleaned = jsonBlockMatch[1].trim();
+      const jsonObjMatch = cleaned.match(/\{[\s\S]*\}/);
+      if (jsonObjMatch) cleaned = jsonObjMatch[0];
+      const parsed = JSON.parse(cleaned);
+      return {
+        date: String(parsed.date || ""),
+        amount: String(parsed.amount || ""),
+        merchant: String(parsed.merchant || ""),
+        productName: String(parsed.productName || ""),
+        status: String(parsed.status || ""),
+        paymentMethod: String(parsed.paymentMethod || ""),
+        transactionId: String(parsed.transactionId || ""),
+      };
+    }
+
+    async function extractDataFromImage(apiKey, file) {
+      const genAI = new GoogleGenAI({ apiKey });
+      const base64Data = await fileToBase64(file);
+      const response = await genAI.models.generateContent({
+        model: "gemini-2.5-flash-preview-05-20",
+        contents: [{
+          role: "user",
+          parts: [
+            { text: EXTRACTION_PROMPT },
+            { inlineData: { mimeType: file.type, data: base64Data } },
+          ],
+        }],
+      });
+      const text = response.text ?? "";
+      if (!text) throw new Error("Empty response from Gemini API");
+      return parseJsonResponse(text);
+    }
+
+    // ── ProcessingItemCard ──────────────────────────────────────────────
+
+    function ProcessingItemCard({ item }) {
+      const statusConfig = {
+        pending: {
+          icon: <ImageIcon className="w-4 h-4 text-gray-400" />,
+          label: "대기 중", bgColor: "bg-gray-50",
+          borderColor: "border-gray-200", textColor: "text-gray-500",
+        },
+        processing: {
+          icon: <Loader2 className="w-4 h-4 text-alipay-500 animate-spin" />,
+          label: "분석 중...", bgColor: "bg-blue-50",
+          borderColor: "border-blue-200", textColor: "text-blue-600",
+        },
+        success: {
+          icon: <CheckCircle2 className="w-4 h-4 text-emerald-500" />,
+          label: "완료", bgColor: "bg-emerald-50",
+          borderColor: "border-emerald-200", textColor: "text-emerald-600",
+        },
+        error: {
+          icon: <AlertCircle className="w-4 h-4 text-red-500" />,
+          label: "오류", bgColor: "bg-red-50",
+          borderColor: "border-red-200", textColor: "text-red-600",
+        },
+      };
+      const config = statusConfig[item.status];
+
+      return (
+        <div className={`flex items-center gap-3 p-3 rounded-lg border ${config.borderColor} ${config.bgColor} transition-all duration-300`}>
+          <div className="w-12 h-12 rounded-md overflow-hidden flex-shrink-0 bg-white border border-gray-200">
+            <img src={item.previewUrl} alt={item.file.name} className="w-full h-full object-cover" />
+          </div>
+          <div className="flex-1 min-w-0">
+            <p className="text-sm font-medium text-gray-700 truncate">{item.file.name}</p>
+            <p className={`text-xs mt-0.5 ${config.textColor}`}>{item.error || config.label}</p>
+          </div>
+          <div className="flex-shrink-0">{config.icon}</div>
+        </div>
+      );
+    }
+
+    // ── ResultTable ─────────────────────────────────────────────────────
+
+    const COLUMNS = [
+      { key: "date", label: "날짜", width: "min-w-[150px]" },
+      { key: "amount", label: "금액 (CNY)", width: "min-w-[110px]" },
+      { key: "merchant", label: "상점", width: "min-w-[140px]" },
+      { key: "productName", label: "상품명", width: "min-w-[160px]" },
+      { key: "status", label: "상태", width: "min-w-[100px]" },
+      { key: "paymentMethod", label: "결제 수단", width: "min-w-[120px]" },
+      { key: "transactionId", label: "거래 ID", width: "min-w-[200px]" },
+    ];
+
+    function ResultTable({ items }) {
+      const [copied, setCopied] = useState(false);
+
+      const successItems = useMemo(
+        () => items.filter((item) => item.status === "success" && item.data), [items]
+      );
+      const totalAmount = useMemo(() => {
+        return successItems.reduce((sum, item) => {
+          const amount = parseFloat(item.data.amount);
+          return sum + (isNaN(amount) ? 0 : amount);
+        }, 0);
+      }, [successItems]);
+
+      const handleCopy = async () => {
+        const headers = COLUMNS.map((col) => col.label).join("\t");
+        const rows = successItems.map((item) =>
+          COLUMNS.map((col) => item.data[col.key] || "").join("\t")
+        );
+        const tsv = [headers, ...rows].join("\n");
+        try {
+          await navigator.clipboard.writeText(tsv);
+          setCopied(true);
+          setTimeout(() => setCopied(false), 2000);
+        } catch {
+          const textarea = document.createElement("textarea");
+          textarea.value = tsv;
+          document.body.appendChild(textarea);
+          textarea.select();
+          document.execCommand("copy");
+          document.body.removeChild(textarea);
+          setCopied(true);
+          setTimeout(() => setCopied(false), 2000);
+        }
+      };
+
+      if (successItems.length === 0) {
+        return (
+          <div className="flex flex-col items-center justify-center h-full text-gray-400 gap-3">
+            <TableIcon className="w-16 h-16 stroke-1" />
+            <div className="text-center">
+              <p className="text-lg font-medium">결과 테이블</p>
+              <p className="text-sm mt-1">이미지를 업로드하면 추출된 데이터가 여기에 표시됩니다</p>
+            </div>
+          </div>
+        );
+      }
+
+      return (
+        <div className="flex flex-col h-full">
+          <div className="flex items-center justify-between mb-3">
+            <h2 className="text-lg font-semibold text-gray-800">
+              추출 결과 <span className="text-sm font-normal text-gray-500">({successItems.length}건)</span>
+            </h2>
+            <button onClick={handleCopy}
+              className="inline-flex items-center gap-1.5 px-3 py-1.5 text-sm font-medium rounded-lg border border-gray-300 bg-white text-gray-700 hover:bg-gray-50 transition-colors">
+              {copied ? (
+                <><CheckCircle2 className="w-4 h-4 text-emerald-500" /><span className="text-emerald-600">복사 완료!</span></>
+              ) : (
+                <><Copy className="w-4 h-4" /><span>클립보드 복사</span></>
+              )}
+            </button>
+          </div>
+          <div className="flex-1 overflow-auto rounded-lg border border-gray-200 bg-white custom-scrollbar">
+            <table className="w-full text-sm">
+              <thead className="sticky top-0 z-10">
+                <tr className="bg-gray-50 border-b border-gray-200">
+                  <th className="px-3 py-2.5 text-left text-xs font-semibold text-gray-500 uppercase tracking-wider w-10">#</th>
+                  {COLUMNS.map((col) => (
+                    <th key={col.key} className={`px-3 py-2.5 text-left text-xs font-semibold text-gray-500 uppercase tracking-wider ${col.width}`}>
+                      {col.label}
+                    </th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-gray-100">
+                {successItems.map((item, index) => (
+                  <tr key={item.id} className="hover:bg-blue-50/40 transition-colors">
+                    <td className="px-3 py-2.5 text-gray-400 font-mono text-xs">{index + 1}</td>
+                    {COLUMNS.map((col) => {
+                      const value = item.data[col.key] || "";
+                      const isAmount = col.key === "amount";
+                      return (
+                        <td key={col.key} className={`px-3 py-2.5 ${isAmount ? "font-mono font-semibold text-gray-900" : "text-gray-700"}`}>
+                          {isAmount && value ? `¥${value}` : value || "-"}
+                        </td>
+                      );
+                    })}
+                  </tr>
+                ))}
+              </tbody>
+              <tfoot className="sticky bottom-0">
+                <tr className="bg-gray-50 border-t-2 border-gray-300">
+                  <td className="px-3 py-2.5" />
+                  <td className="px-3 py-2.5 text-xs font-semibold text-gray-500 uppercase">합계</td>
+                  <td className="px-3 py-2.5 font-mono font-bold text-alipay-600 text-base">¥{totalAmount.toFixed(2)}</td>
+                  <td colSpan={5} />
+                </tr>
+              </tfoot>
+            </table>
+          </div>
+        </div>
+      );
+    }
+
+    // ── App ─────────────────────────────────────────────────────────────
+
+    const API_KEY_STORAGE = "alipay-scan-gemini-key";
+
+    function App() {
+      const [apiKey, setApiKey] = useState(() => localStorage.getItem(API_KEY_STORAGE) || "");
+      const [showKey, setShowKey] = useState(false);
+      const [items, setItems] = useState([]);
+      const [isDragging, setIsDragging] = useState(false);
+      const fileInputRef = useRef(null);
+
+      const saveApiKey = (key) => {
+        setApiKey(key);
+        key ? localStorage.setItem(API_KEY_STORAGE, key) : localStorage.removeItem(API_KEY_STORAGE);
+      };
+
+      const processImage = useCallback(async (item) => {
+        setItems((prev) => prev.map((i) => i.id === item.id ? { ...i, status: "processing" } : i));
+        try {
+          const data = await extractDataFromImage(apiKey, item.file);
+          setItems((prev) => prev.map((i) => i.id === item.id ? { ...i, status: "success", data } : i));
+        } catch (err) {
+          setItems((prev) => prev.map((i) => i.id === item.id ? { ...i, status: "error", error: err.message || "추출 실패" } : i));
+        }
+      }, [apiKey]);
+
+      const handleFiles = useCallback((files) => {
+        if (!apiKey) { alert("먼저 Gemini API 키를 입력해주세요."); return; }
+        const imageFiles = Array.from(files).filter((f) => f.type.startsWith("image/"));
+        if (imageFiles.length === 0) return;
+        const newItems = imageFiles.map((file) => ({
+          id: uuidv4(), file, previewUrl: URL.createObjectURL(file),
+          status: "pending", data: null, error: null,
+        }));
+        setItems((prev) => [...prev, ...newItems]);
+        newItems.forEach((item) => processImage(item));
+      }, [apiKey, processImage]);
+
+      const handleDrop = useCallback((e) => { e.preventDefault(); setIsDragging(false); handleFiles(e.dataTransfer.files); }, [handleFiles]);
+      const handleDragOver = useCallback((e) => { e.preventDefault(); setIsDragging(true); }, []);
+      const handleDragLeave = useCallback((e) => { e.preventDefault(); setIsDragging(false); }, []);
+
+      const clearAll = () => { items.forEach((item) => URL.revokeObjectURL(item.previewUrl)); setItems([]); };
+
+      const processingCount = items.filter((i) => i.status === "processing").length;
+      const successCount = items.filter((i) => i.status === "success").length;
+      const errorCount = items.filter((i) => i.status === "error").length;
+
+      return (
+        <div className="h-screen flex flex-col">
+          {/* Header */}
+          <header className="bg-white border-b border-gray-200 px-6 py-3 flex items-center justify-between flex-shrink-0">
+            <div className="flex items-center gap-3">
+              <div className="w-8 h-8 bg-alipay-500 rounded-lg flex items-center justify-center">
+                <Zap className="w-5 h-5 text-white" />
+              </div>
+              <div>
+                <h1 className="text-lg font-bold text-gray-900">Alipay Scan & Sheet</h1>
+                <p className="text-xs text-gray-500">알리페이 거래 스크린샷 → 스프레드시트</p>
+              </div>
+            </div>
+            <div className="flex items-center gap-2">
+              <ShieldCheck className="w-4 h-4 text-gray-400" />
+              <div className="relative">
+                <Key className="absolute left-2.5 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-gray-400" />
+                <input
+                  type={showKey ? "text" : "password"} value={apiKey}
+                  onChange={(e) => saveApiKey(e.target.value)} placeholder="Gemini API Key"
+                  className="pl-8 pr-8 py-1.5 text-sm border border-gray-300 rounded-lg w-64 focus:outline-none focus:ring-2 focus:ring-alipay-500 focus:border-transparent"
+                />
+                <button onClick={() => setShowKey(!showKey)} className="absolute right-2 top-1/2 -translate-y-1/2 text-gray-400 hover:text-gray-600">
+                  {showKey ? <EyeOff className="w-3.5 h-3.5" /> : <Eye className="w-3.5 h-3.5" />}
+                </button>
+              </div>
+            </div>
+          </header>
+
+          {/* Main Content */}
+          <div className="flex-1 flex overflow-hidden">
+            {/* Left Panel */}
+            <div className="w-80 border-r border-gray-200 bg-white flex flex-col flex-shrink-0">
+              <div className="p-4">
+                <div onDrop={handleDrop} onDragOver={handleDragOver} onDragLeave={handleDragLeave}
+                  onClick={() => fileInputRef.current?.click()}
+                  className={`border-2 border-dashed rounded-xl p-6 text-center cursor-pointer transition-all duration-200 ${
+                    isDragging ? "drop-zone-active" : "border-gray-300 hover:border-alipay-500 hover:bg-blue-50/30"
+                  }`}>
+                  <input ref={fileInputRef} type="file" multiple accept="image/*" className="hidden"
+                    onChange={(e) => e.target.files && handleFiles(e.target.files)} />
+                  <div className="flex flex-col items-center gap-2">
+                    {isDragging
+                      ? <Upload className="w-10 h-10 text-alipay-500" />
+                      : <ImagePlus className="w-10 h-10 text-gray-400" />}
+                    <div>
+                      <p className="text-sm font-medium text-gray-700">
+                        {isDragging ? "여기에 놓으세요!" : "이미지를 드래그하거나 클릭"}
+                      </p>
+                      <p className="text-xs text-gray-500 mt-1">PNG, JPG, WEBP 지원 · 여러 장 가능</p>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              {items.length > 0 && (
+                <div className="px-4 pb-2 flex items-center justify-between">
+                  <div className="flex items-center gap-3 text-xs">
+                    <span className="text-gray-500">전체 <span className="font-semibold">{items.length}</span></span>
+                    {processingCount > 0 && <span className="text-blue-600">처리 중 <span className="font-semibold">{processingCount}</span></span>}
+                    {successCount > 0 && <span className="text-emerald-600">완료 <span className="font-semibold">{successCount}</span></span>}
+                    {errorCount > 0 && <span className="text-red-600">오류 <span className="font-semibold">{errorCount}</span></span>}
+                  </div>
+                  <button onClick={clearAll} className="text-xs text-gray-400 hover:text-red-500 transition-colors" title="전체 삭제">
+                    <Trash2 className="w-3.5 h-3.5" />
+                  </button>
+                </div>
+              )}
+
+              <div className="flex-1 overflow-y-auto px-4 pb-4 space-y-2 custom-scrollbar">
+                {items.map((item) => <ProcessingItemCard key={item.id} item={item} />)}
+              </div>
+            </div>
+
+            {/* Right Panel */}
+            <div className="flex-1 p-6 overflow-hidden">
+              <ResultTable items={items} />
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    // ── Mount ────────────────────────────────────────────────────────────
+
+    const root = createRoot(document.getElementById("root"));
+    root.render(<App />);
+  </script>
 </body>
 </html>
